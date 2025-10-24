@@ -686,16 +686,34 @@ class MangaProcessor:
         instance_mask = np.zeros((height, width), dtype=np.uint8)
         
         for idx, balloon in enumerate(balloons, start=1):
-            x, y, w, h = balloon.bbox
-            
-            # バウンディングボックスで塗りつぶし
-            # Track A: 全て255で塗る
-            cv2.rectangle(binary_mask, (x, y), (x+w, y+h), 255, -1)
-            
-            # Track B: 各吹き出しに異なるIDを割り当て
-            # インスタンスIDは1から始まる（0は背景）
-            instance_id = min(idx, 254)  # 255以下に制限
-            cv2.rectangle(instance_mask, (x, y), (x+w, y+h), instance_id, -1)
+            # Try to use contour if available; otherwise fallback to bbox
+            contour = None
+            try:
+                if hasattr(balloon, 'contour') and balloon.contour is not None:
+                    # Ensure contour is in the right shape for drawContours
+                    contour = balloon.contour
+                    if isinstance(contour, list):
+                        # convert list of points to numpy array of shape (-1,1,2)
+                        contour = np.array(contour, dtype=np.int32)
+                    if contour.ndim == 2 and contour.shape[1] == 2:
+                        contour = contour.reshape((-1, 1, 2))
+                else:
+                    contour = None
+            except Exception:
+                contour = None
+
+            if contour is not None:
+                # Track A: draw filled contour for binary mask
+                cv2.drawContours(binary_mask, [contour], -1, 255, thickness=-1)
+                # Track B: draw filled contour with instance id
+                instance_id = min(idx, 254)
+                cv2.drawContours(instance_mask, [contour], -1, int(instance_id), thickness=-1)
+            else:
+                # Fallback to bbox if contour is not available
+                x, y, w, h = balloon.bbox
+                cv2.rectangle(binary_mask, (x, y), (x + w, y + h), 255, -1)
+                instance_id = min(idx, 254)
+                cv2.rectangle(instance_mask, (x, y), (x + w, y + h), int(instance_id), -1)
         
         # 保存
         binary_path = self.eval_masks_dir / f"{image_filename}.png"
@@ -863,6 +881,7 @@ class MangaProcessor:
     def process_single_image_for_evaluation(self, image_path: str) -> List[Balloon]:
         """
         評価用: 単一画像を処理して吹き出しを検出
+        C++版と同様にページ分割→統合出力を行う
         
         Parameters:
             image_path: 画像ファイルパス
@@ -873,34 +892,63 @@ class MangaProcessor:
         image_path = Path(image_path)
         image_filename = image_path.stem
         
-        # 画像読み込み
-        img = cv2.imread(str(image_path))
+        # 画像読み込み（C++と同じグレースケール読み込み）
+        img = cv2.imread(str(image_path), 0)  # グレースケール
         if img is None:
             print(f"Error: Cannot load {image_path}")
             return []
         
-        # グレースケール変換
-        if len(img.shape) == 3:
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = img
+        # 元画像のサイズ（統合マスク用）
+        orig_h, orig_w = img.shape[:2]
         
-        # ページ全体で吹き出し検出（パネル分割なし）
-        # evaluation_datasetは既に単一ページ画像
-        balloons = self.speechballoon_detect(gray)
+        # ページ分割
+        pages = self.page_cut(img)
         
-        # 誤検出除去
-        filtered_balloons = self.remove_false_balloons(balloons)
+        # 全ページの吹き出しを統合
+        all_balloons = []
         
-        # 評価用出力を生成
+        for j, page in enumerate(pages):
+            # ページ分類
+            is_black_page = self.get_page_type(page)
+            if is_black_page:
+                continue
+            
+            # ページオフセット計算（C++版と同じロジック）
+            page_offset_x = 0
+            if orig_w > orig_h and len(pages) == 2:
+                # 見開きページの場合
+                # PageCutは [右ページ, 左ページ] の順で返す
+                if j == 0:  # 右ページ
+                    page_offset_x = orig_w // 2
+                else:  # 左ページ
+                    page_offset_x = 0
+            
+            # 吹き出し検出
+            balloons = self.speechballoon_detect(page)
+            
+            # 誤検出除去
+            filtered_balloons = self.remove_false_balloons(balloons)
+            
+            # bboxにページオフセットを適用
+            for balloon in filtered_balloons:
+                x, y, w, h = balloon.bbox
+                balloon.bbox = (x + page_offset_x, y, w, h)
+                
+                # contourにもオフセットを適用
+                if balloon.contour is not None:
+                    balloon.contour = balloon.contour + np.array([page_offset_x, 0])
+            
+            all_balloons.extend(filtered_balloons)
+        
+        # 評価用出力を生成（統合された全吹き出しで1枚のマスク）
         if self.evaluation_mode:
             self.create_evaluation_outputs(
-                filtered_balloons, 
-                gray.shape,
+                all_balloons, 
+                (orig_h, orig_w),  # 元画像サイズ
                 image_filename
             )
         
-        return filtered_balloons
+        return all_balloons
     
     def process_evaluation_dataset(self, image_dir: Path):
         """

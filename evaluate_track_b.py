@@ -401,10 +401,23 @@ if __name__ == "__main__":
     for pred_path in pred_files:
         image_id = pred_path.stem
         gt_path = gt_dir / pred_path.name
-        
+
         if not gt_path.exists():
-            print(f"Warning: GT not found for {image_id}, skipping...")
-            continue
+            # Fallback: if prediction filename has a trailing _<pageidx>, try GT without that suffix
+            import re
+            stem = pred_path.stem
+            m = re.match(r"(.*)_(\d+)$", stem)
+            if m:
+                fallback_name = m.group(1) + pred_path.suffix
+                gt_candidate = gt_dir / fallback_name
+                if gt_candidate.exists():
+                    gt_path = gt_candidate
+                else:
+                    print(f"Warning: GT not found for {image_id}, skipping...")
+                    continue
+            else:
+                print(f"Warning: GT not found for {image_id}, skipping...")
+                continue
         
         # インスタンス読み込み
         pred_instances = load_instances_from_mask(pred_path, score=1.0)
